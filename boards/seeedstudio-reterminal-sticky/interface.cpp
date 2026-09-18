@@ -1,12 +1,12 @@
+#include "hal/device.h"
+#include "hal/inputs/buttons.h"
+#include "hal/inputs/touch.h"
 #include "idf/launcher_platform.h"
 #include "powerSave.h"
 #include <SPI.h>
-#include <TouchDrvGT911.hpp>
 #include <Wire.h>
 #include <esp_sleep.h>
 #include <interface.h>
-
-TouchDrvGT911 touch;
 
 // Seeed reTerminal Sticky.
 //
@@ -21,10 +21,6 @@ TouchDrvGT911 touch;
 // them the board's power rails are not reliably held up, which plausibly
 // explains touch/SD/button symptoms that looked unrelated.
 
-// --- buttons -----------------------------------------------------------
-// Plain digital, active low. GPIO4 is the "AI / Power" button in the vendor
-// doc — this launcher repurposes it as Select, with a long hold to power off
-// (see checkReboot()).
 #define BTN_PREV 5    // vendor doc: "Up"
 #define BTN_NEXT 6    // vendor doc: "Down"
 #define BTN_SEL_PWR 4 // vendor doc: "AI / Power"
@@ -37,15 +33,18 @@ TouchDrvGT911 touch;
 // Must be driven high before the panel is brought up.
 #define EPD_EN 47
 
+// --- microSD power enable -----------------------------------------------
+#define SD_PWR_EN 10
+
 // --- GT911 touch (I2C0) -------------------------------------------------
 #define TOUCH_SDA 3
 #define TOUCH_SCL 2
 #define TOUCH_EN 42 // active HIGH, confirmed by the reference firmware
 #define TOUCH_RST 41
 #define TOUCH_INT 21
-#define TOUCH_ADDR_L 0x5D // GT911 default I2C address
-#define TOUCH_ADDR_H 0x14 // GT911 alternate address (INT held high at reset)
-static uint8_t touchAddr = TOUCH_ADDR_L;
+#define TOUCH_ADDR_H                                                                                         \
+    0x14 // GT911_SLAVE_ADDRESS_H -- hal_touch_init() falls
+         // back to 0x5D on its own if this one doesn't answer
 
 // --- BQ27220 fuel gauge (I2C1, its own bus — not the touch bus) --------
 #define GAUGE_SDA 1
@@ -60,26 +59,88 @@ static uint8_t touchAddr = TOUCH_ADDR_L;
 #define BAT_CHG_EN 39
 
 static bool touchReady = false;
+static uint16_t touchNativeWidth = TFT_WIDTH;
+static uint16_t touchNativeHeight = TFT_HEIGHT;
 
+static DeviceTouch touchCfg() {
+    DeviceTouch cfg;
+    cfg.pin_rst = TOUCH_RST;
+    cfg.pin_irq = TOUCH_INT;
+    cfg.gt911_int_sync = true;
+    return cfg;
+}
+
+// Prev/Next/Sel -- Prev+Next held together also raises Esc (hal_buttons_poll_3
+// standard combo; this board never had an Esc source of its own before).
+static DeviceButtons buttonsCfg() { return DeviceButtons{BTN_PREV, BTN_NEXT, BTN_SEL_PWR}; }
+
+// hal_touch_init()'s GT911 reset/probe/chip-ID sequence and register map
+// (0x8140/0x8146/0x814E/0x814F) are register-identical to the hand-rolled
+// driver this replaced -- confirmed against lib/SensorLib/src/touch/
+// TouchDrvGT911.cpp before migrating, not just assumed. Coordinates are
+// still read via hal_touch_read_raw() and rescaled by hand below rather than
+// through hal_touch_read()'s cfg.SwapXY/setTargetResolution() path: the
+// panel's native touch resolution isn't guaranteed to match its pixel
+// dimensions on this board, and SensorLib's setSwapXY()+setTargetResolution()
+// combination scales the post-swap axis using the pre-swap axis's native
+// resolution (see TouchDrvInterface::updateXY()), which is wrong on a
+// non-square native resolution -- the original per-rotation math here
+// avoids that entirely by scaling before ever mixing axes.
 static bool bringUpTouch() {
-    static const uint8_t addrs[2] = {TOUCH_ADDR_L, TOUCH_ADDR_H};
-
-    launcherGpioOutput(TOUCH_EN);
-    launcherGpioWrite(TOUCH_EN, HIGH);
-    launcherDelayMs(250);
-
-    for (uint8_t addr : addrs) {
-        touch.setPins(TOUCH_RST, TOUCH_INT);
-        if (touch.begin(Wire, addr, TOUCH_SDA, TOUCH_SCL)) {
-            touchAddr = addr;
-            launcherConsolePrintf("GT911 found at addr=0x%02X\n", addr);
-            return true;
-        }
+    if (!hal_touch_init(touchCfg(), TOUCH_ADDR_H)) {
+        launcherConsolePrintf(
+            "%s\n", String("Failed to find GT911 on either address - check your wiring!").c_str()
+        );
+        return false;
     }
-    launcherConsolePrintf(
-        "%s\n", String("Failed to find GT911 on either address - check your wiring!").c_str()
-    );
-    return false;
+    uint16_t w = 0, h = 0;
+    if (hal_touch_get_resolution(w, h)) {
+        touchNativeWidth = w;
+        touchNativeHeight = h;
+    }
+    launcherConsolePrintf("GT911 found, sensor=%ux%u\n", touchNativeWidth, touchNativeHeight);
+    return true;
+}
+
+static uint16_t scaleTouchCoordinate(uint16_t value, uint16_t sourceMax, uint16_t targetMax) {
+    if (sourceMax == 0 || targetMax == 0) return 0;
+    if (value > sourceMax) value = sourceMax;
+    return (uint16_t)(((uint32_t)value * targetMax + sourceMax / 2U) / sourceMax);
+}
+
+static uint8_t readTouchPoint(int16_t *x, int16_t *y) {
+    LTouchPoint raw;
+    if (!hal_touch_read_raw(raw)) return 0;
+
+    // The sensor is mounted portrait (480x800). Map the raw point into the
+    // portrait frame (rotation 3) first, then turn it into the other three
+    // rotations with the same 90-degree steps GxEPD2 uses for the framebuffer.
+    // 触摸传感器按竖屏(480x800)安装：先算出竖屏(rotation 3)坐标，
+    // 再按屏幕库相同的 90 度旋转步骤推出其余三个方向。
+    const uint16_t rawX = (uint16_t)raw.x;
+    const uint16_t rawY = (uint16_t)raw.y > touchNativeHeight ? touchNativeHeight : (uint16_t)raw.y;
+    const int16_t px = scaleTouchCoordinate(rawX, touchNativeWidth, TFT_HEIGHT - 1);
+    const int16_t py = scaleTouchCoordinate(touchNativeHeight - rawY, touchNativeHeight, TFT_WIDTH - 1);
+
+    switch (rotation) {
+        case 0:
+            *x = py;
+            *y = (TFT_HEIGHT - 1) - px;
+            break;
+        case 1:
+            *x = (TFT_HEIGHT - 1) - px;
+            *y = (TFT_WIDTH - 1) - py;
+            break;
+        case 2:
+            *x = (TFT_WIDTH - 1) - py;
+            *y = px;
+            break;
+        default:
+            *x = px;
+            *y = py;
+            break;
+    }
+    return 1;
 }
 
 /***************************************************************************************
@@ -101,58 +162,84 @@ static void powerOnHold() {
     powerLockPulse();
 }
 
-/***************************************************************************************
-** Function name: _setup_gpio()
-** Location: main.cpp
-** Description:   initial setup for the device
-***************************************************************************************/
 void _setup_gpio() {
 
     powerOnHold();
 
-    launcherGpioInputPullup(BTN_PREV);
-    launcherGpioInputPullup(BTN_NEXT);
-    launcherGpioInputPullup(BTN_SEL_PWR);
+    // Release any RTC GPIO hold left over from a deep sleep entered by a
+    // launched app (e.g. an e-paper app that calls gpio_hold_en()/
+    // gpio_deep_sleep_hold_en() on these pins to keep rails/reset lines
+    // fixed while asleep, then wakes via reset back into the launcher).
+    // gpio_reset_pin() below does NOT clear a hold latch by itself -- an
+    // unreleased hold silently discards every write this function makes,
+    // which is what "display never powers, GT911 never answers" looks
+    // like after returning from such an app.
+    gpio_hold_dis((gpio_num_t)TOUCH_EN);
+    gpio_hold_dis((gpio_num_t)TOUCH_RST);
+    gpio_hold_dis((gpio_num_t)TOUCH_INT);
+    gpio_hold_dis((gpio_num_t)SD_PWR_EN);
+    gpio_hold_dis((gpio_num_t)EPD_EN);
+    gpio_hold_dis((gpio_num_t)BAT_CHG_EN);
+    gpio_deep_sleep_hold_dis();
 
+    // Powered up here, well ahead of the first setupSdCard() call later in
+    // boot, so the confirmed 100ms settle time is already spent by then.
+    gpio_reset_pin((gpio_num_t)TOUCH_INT);
+    gpio_reset_pin((gpio_num_t)TOUCH_EN);
+    gpio_reset_pin((gpio_num_t)SD_PWR_EN);
+    gpio_reset_pin((gpio_num_t)EPD_EN);
+    gpio_reset_pin((gpio_num_t)BAT_CHG_EN);
+    launcherGpioOutput(TOUCH_EN);
+    launcherGpioOutput(SD_PWR_EN);
     launcherGpioOutput(EPD_EN);
-    launcherGpioWrite(EPD_EN, HIGH);
-
-    // Active low; left undriven the charger stays disabled.
     launcherGpioOutput(BAT_CHG_EN);
-    launcherGpioWrite(BAT_CHG_EN, LOW);
-
     launcherGpioOutput(TFT_CS);
-    launcherGpioWrite(TFT_CS, HIGH);
     launcherGpioOutput(SDCARD_CS);
+
+    launcherGpioOutput(TOUCH_INT);
+    launcherGpioWrite(TOUCH_INT, LOW);
+
+    launcherGpioWrite(TOUCH_EN, LOW);
+    launcherGpioWrite(SD_PWR_EN, LOW);
+    launcherGpioWrite(EPD_EN, LOW);
+    launcherGpioWrite(BAT_CHG_EN, HIGH);
+    launcherDelayMs(100); // Wait for 3.3V rails to settle before touching the bus
+
+    launcherGpioWrite(TOUCH_EN, HIGH);
+    launcherGpioWrite(SD_PWR_EN, HIGH);
+    launcherGpioWrite(EPD_EN, HIGH);
+    launcherGpioWrite(BAT_CHG_EN, LOW); // Active low; left undriven the charger stays disabled.
+    // Drive CS Pins High
+    launcherGpioWrite(TFT_CS, HIGH);
     launcherGpioWrite(SDCARD_CS, HIGH);
+
+    // Setup Inputs
+    hal_buttons_init(buttonsCfg(), 3);
+
+    // Start SPI interface
     SPI.begin(TFT_SCLK, SDCARD_MISO, TFT_MOSI, TFT_CS);
 
+    // Restart Wire on the pinouts
+    Wire.end();
     pinMode(TOUCH_SDA, INPUT_PULLUP);
     pinMode(TOUCH_SCL, INPUT_PULLUP);
+    if (!Wire.begin(TOUCH_SDA, TOUCH_SCL)) launcherConsolePrintln("Fail Starting Wire");
+    // The fuel gauge is on its own I2C bus (Wire1), separate from touch.
     pinMode(GAUGE_SDA, INPUT_PULLUP);
     pinMode(GAUGE_SCL, INPUT_PULLUP);
-
-    // The fuel gauge is on its own I2C bus (Wire1), separate from touch.
-    Wire1.begin(GAUGE_SDA, GAUGE_SCL, GAUGE_I2C_FREQ);
+    if (!Wire1.begin(GAUGE_SDA, GAUGE_SCL, GAUGE_I2C_FREQ)) launcherConsolePrintln("Fail Starting Wire1");
     Wire1.setTimeOut(4);
+
+    // Time to raise 3.3V rails on SDCard/TFT/Touch
+    launcherDelayMs(250);
 }
 
-/***************************************************************************************
-** Function name: _post_setup_gpio()
-** Location: main.cpp
-** Description:   second stage gpio setup to make a few functions work
-***************************************************************************************/
 void _post_setup_gpio() {
     touchReady = bringUpTouch();
     // Swap/mirror per rotation is set in InputHandler(), same as xteink-x4pro
     // (same 800x480 native panel geometry).
 }
 
-/***************************************************************************************
-** Function name: getBattery()
-** location: display.cpp
-** Description:   Delivers the battery value from 1-100
-***************************************************************************************/
 int getBattery() {
     // The launcher asks on every header redraw; cache it and keep the last
     // good reading on an I2C error rather than blink to 0.
@@ -174,110 +261,61 @@ int getBattery() {
     return cached;
 }
 
-/*********************************************************************
-** Function: setBrightness
-** location: settings.cpp
-** set brightness value
-**********************************************************************/
 void _setBrightness(uint8_t brightval) {
     // No backlight and no frontlight on this panel.
     (void)brightval;
 }
 
-/*********************************************************************
-** Function: InputHandler
-** Handles the variables PrevPress, NextPress, SelPress, AnyKeyPress and EscPress
-**********************************************************************/
 void InputHandler(void) {
-    static unsigned long tm = launcherMillis();
+    static unsigned long pool_tm = launcherMillis();
+    static unsigned long ready_tm = launcherMillis();
 
-    // GT911 on this board reports touches pre-transformed by its own factory
-    // config into a fixed 800x480 frame (confirmed by the reference firmware
-    // reading back "sensor=800x480" from the chip) -- NOT the panel's raw
-    // pixel grid, and NOT a simple axis swap of it. At the default rotation
-    // (3, portrait 480x800) the reference firmware needs no XY swap at all,
-    // only a proportional rescale (800->480 / 480->800) plus a Y-axis flip;
-    // that combination is reproduced exactly below and is hardware-confirmed.
-    // Rotations 0/1/2 follow the same 90-degree-step pattern used on the
-    // other e-paper boards, composed on top of that confirmed anchor, but are
-    // NOT hardware-tested -- revisit if touch is misaligned in a non-default
-    // rotation.
-    static uint8_t lastRot = 5;
-    if (touchReady && lastRot != rotation) {
-        // setResolution() feeds the scale-factor math, and swapXY is applied
-        // *before* scaling -- so when swapXY is on, the raw resolution has to
-        // be declared already-swapped too, or the scale factors get matched
-        // to the wrong axis.
-        if (rotation == 3) {
-            touch.setResolution(TFT_WIDTH, TFT_HEIGHT);
-            touch.setTargetResolution(TFT_HEIGHT, TFT_WIDTH);
-            touch.setSwapXY(false);
-            touch.setMirrorXY(false, true);
-        } else if (rotation == 1) {
-            touch.setResolution(TFT_WIDTH, TFT_HEIGHT);
-            touch.setTargetResolution(TFT_HEIGHT, TFT_WIDTH);
-            touch.setSwapXY(false);
-            touch.setMirrorXY(true, false);
-        } else if (rotation == 0) {
-            touch.setResolution(TFT_HEIGHT, TFT_WIDTH);
-            touch.setTargetResolution(TFT_WIDTH, TFT_HEIGHT);
-            touch.setSwapXY(true);
-            touch.setMirrorXY(false, false);
-        } else if (rotation == 2) {
-            touch.setResolution(TFT_HEIGHT, TFT_WIDTH);
-            touch.setTargetResolution(TFT_WIDTH, TFT_HEIGHT);
-            touch.setSwapXY(true);
-            touch.setMirrorXY(true, true);
-        }
-        lastRot = rotation;
+    hal_buttons_poll_3(buttonsCfg());
+
+    if (launcherMillis() - ready_tm > 500 && !touchReady) {
+        if (!Wire.begin(TOUCH_SDA, TOUCH_SCL)) launcherConsolePrintln("Fail Starting Wire");
+        touchReady = bringUpTouch();
+        ready_tm = launcherMillis();
     }
+    if (!touchReady) return;
+    if (launcherMillis() - pool_tm < 100 && !LongPress) return;
+    pool_tm = launcherMillis();
 
     int16_t tx = 0, ty = 0;
-    const uint8_t touched = touchReady ? touch.getPoint(&tx, &ty, 1) : 0;
-
-    if (launcherMillis() - tm > 200 || LongPress) {
-    } else return;
-
-    const bool prev = launcherGpioRead(BTN_PREV) == LOW;
-    const bool next = launcherGpioRead(BTN_NEXT) == LOW;
-    const bool sel = launcherGpioRead(BTN_SEL_PWR) == LOW;
-
-    if (!prev && !next && !sel && !touched) return;
-
-    tm = launcherMillis();
-    if (!wakeUpScreen()) AnyKeyPress = true;
-    else return;
-
-    if (prev) PrevPress = true;
-    if (next) NextPress = true;
-    if (sel) SelPress = true;
-
-    if (touched) {
-        touchPoint.x = tx;
-        touchPoint.y = ty;
-        touchPoint.pressed = true;
-        touchHeatMap(touchPoint);
+    if (readTouchPoint(&tx, &ty)) {
+        LTouchPoint t;
+        t.x = tx;
+        t.y = ty;
+        t.pressed = true;
+        hal_touch_apply(t);
     }
 }
 
-/*********************************************************************
-** Function: powerOff
-** location: mykeyboard.cpp
-** Turns off the device (or try to)
-**********************************************************************/
+/***************************************************************************************
+** Function name: reboot()
+** Description:   Power-cycles the microSD rail before the CPU resets, so the
+**                firmware being launched finds the card in its power-on state.
+**                重启 CPU 前先给 microSD 断电，让被启动的固件拿到一张刚上电的卡。
+***************************************************************************************/
+void reboot() {
+    launcherGpioWrite(SDCARD_CS, HIGH);
+    launcherGpioWrite(SD_PWR_EN, LOW);
+    launcherDelayMs(200);
+    ESP.restart();
+}
+
 void powerOff() {
     while (launcherGpioRead(BTN_SEL_PWR) == LOW) launcherDelayMs(50);
     launcherDelayMs(100);
 
     tft->fillScreen(BGCOLOR);
-    tft->setTextSize(1);
+    initDisplay(true);
+    tft->setTextSize(FG);
     tft->setTextColor(FGCOLOR);
-    tft->drawCentreString("Powered OFF", tftWidth / 2, tftHeight / 2, 1);
+    tft->drawCentreString("Powered OFF", tftWidth / 2, tftHeight - 100, 1);
     tft->display();
+    launcherDelayMs(1000);
 
-    // Drop the latch: on this board that is what actually cuts power, per
-    // the reference firmware's power_off(). The deep-sleep call below is a
-    // fallback in case the hardware stays alive on USB power.
     gpio_hold_dis((gpio_num_t)POWER_HOLD);
     launcherGpioWrite(POWER_HOLD, LOW);
     powerLockPulse();
@@ -285,42 +323,4 @@ void powerOff() {
     esp_sleep_enable_ext0_wakeup((gpio_num_t)BTN_SEL_PWR, LOW);
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_deep_sleep_start();
-}
-
-/*********************************************************************
-** Function: checkReboot
-** location: mykeyboard.cpp
-** Btn logic to turn off the device (name is odd btw)
-**********************************************************************/
-void checkReboot() {
-    if (launcherGpioRead(BTN_SEL_PWR) != LOW) return;
-
-    const uint32_t start = launcherMillis();
-    int lastCountDown = -1;
-    while (launcherGpioRead(BTN_SEL_PWR) == LOW) {
-        if (launcherMillis() - start > 500) {
-            const int countDown = (launcherMillis() - start) / 1000 + 1;
-            if (countDown < 3) {
-                // One refresh per second at most: this panel cannot repaint
-                // per frame.
-                if (countDown != lastCountDown) {
-                    lastCountDown = countDown;
-                    tft->setTextSize(1);
-                    tft->setTextColor(FGCOLOR, BGCOLOR);
-                    tft->drawCentreString("PWR OFF IN " + String(countDown) + "/2", tftWidth / 2, 12, 1);
-                    tft->display();
-                }
-            } else {
-                tft->fillScreen(BGCOLOR);
-                tft->display();
-                powerOff();
-            }
-        }
-        launcherDelayMs(10);
-    }
-
-    if (lastCountDown >= 0) {
-        tft->fillRect(0, 12, tftWidth, LH, BGCOLOR);
-        tft->display();
-    }
 }

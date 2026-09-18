@@ -45,7 +45,14 @@
 //   wifi add <SSID> <PWD>                          save a network without connecting to it
 //   wifi del <SSID>                                remove one saved network
 //   wifi clear                                     remove all saved networks
-//   calibrate                                     run the interactive touch calibration wizard
+//   wifi list                                      list saved networks, same format as "wifi
+//                                                  scan" but rssi=0; auth is "unknown" for
+//                                                  networks saved with a password, "open" for
+//                                                  networks saved without one
+//   settings get                                   print settings[0] as JSON
+//   settings set <json>                            replace settings[0] with <json>, apply it to
+//                                                  the live globals, and persist it
+//   calibrate                                      run the interactive touch calibration wizard
 //   calibrate set <Xmax> <Xmin> <Ymax> <Ymin> <rot>
 //                                                  write raw calibration values straight to NVS
 //   calibrate show                                print the calibration currently saved in NVS
@@ -177,6 +184,10 @@ static void handleNavCommand(const String &target) {
         SelPress = true;
     } else if (target.equalsIgnoreCase("EscPress") || target.equalsIgnoreCase("esc")) {
         EscPress = true;
+    } else if (target.equalsIgnoreCase("UpPress") || target.equalsIgnoreCase("up")) {
+        UpPress = true;
+    } else if (target.equalsIgnoreCase("DownPress") || target.equalsIgnoreCase("down")) {
+        DownPress = true;
     } else {
         launcherConsolePrintln("ERR unknown nav target");
         return;
@@ -638,6 +649,15 @@ static void handleWifiClearCommand() {
     launcherConsolePrintln("OK cleared all networks");
 }
 
+static void handleWifiListCommand() {
+    launcherConsolePrintln("== WiFi networks ==");
+    for (const auto &net : getSavedWifiNetworks()) {
+        launcherConsolePrintf(
+            "%-32s rssi=%-4d auth=%-9s\n", net.ssid.c_str(), 0, net.hasPassword ? "unknown" : "open"
+        );
+    }
+}
+
 static void handleWifiCommand(const std::vector<String> &tokens) {
     const String &sub = tokens[1];
     if (sub.equalsIgnoreCase("auto")) {
@@ -654,6 +674,8 @@ static void handleWifiCommand(const std::vector<String> &tokens) {
         handleWifiDelCommand(tokens);
     } else if (sub.equalsIgnoreCase("clear")) {
         handleWifiClearCommand();
+    } else if (sub.equalsIgnoreCase("list")) {
+        handleWifiListCommand();
     } else if (sub.equalsIgnoreCase("hosted")) {
         // Clears the latched "co-processor is broken" verdict. Needed after
         // flashing esp_hosted firmware onto the co-processor, otherwise the
@@ -823,6 +845,29 @@ static void handleSdioCommand(const std::vector<String> &tokens) {
 }
 #endif
 
+static void handleSettingsPrintCommand() { printSettingsJson(); }
+
+static void handleSettingsLoadCommand(const String &json) {
+    if (json.length() == 0) {
+        launcherConsolePrintln("Usage: settings set <json>");
+        return;
+    }
+    if (!loadSettingsJson(json)) {
+        launcherConsolePrintln("ERR invalid settings json");
+        return;
+    }
+    launcherConsolePrintln("OK settings loaded");
+}
+
+static bool stripCommandPrefix(const String &line, const char *prefix, String &rest) {
+    size_t prefixLen = strlen(prefix);
+    if (line.length() < prefixLen) return false;
+    if (!line.substring(0, prefixLen).equalsIgnoreCase(prefix)) return false;
+    rest = line.substring(prefixLen);
+    rest.trim();
+    return true;
+}
+
 static void printVersion() { launcherConsolePrintln("Launcher " LAUNCHER); }
 
 static void printWhoami() { launcherConsolePrintln(device_name.c_str()); }
@@ -853,7 +898,10 @@ static void printHelp() {
     launcherConsolePrintln("  wifi add <SSID> <PWD>");
     launcherConsolePrintln("  wifi del <SSID>");
     launcherConsolePrintln("  wifi clear");
+    launcherConsolePrintln("  wifi list");
     launcherConsolePrintln("  wifi hosted retry");
+    launcherConsolePrintln("  settings get");
+    launcherConsolePrintln("  settings set <json>");
 #if defined(SDIO2_CLK)
     launcherConsolePrintln("  sdio show");
     launcherConsolePrintln("  sdio set <clk> <cmd> <d0> <d1> <d2> <d3> <rst>");
@@ -971,6 +1019,12 @@ static void handleSdInstallCommand(const String &sdPath, const SdInstallOptions 
 }
 
 static void handleSerialCommand(const String &line) {
+    String settingsJson;
+    if (stripCommandPrefix(line, "settings set ", settingsJson)) {
+        handleSettingsLoadCommand(settingsJson);
+        return;
+    }
+
     std::vector<String> tokens = splitTokens(line);
     if (tokens.empty()) return;
     const String &cmd = tokens[0];
@@ -1011,6 +1065,10 @@ static void handleSerialCommand(const String &line) {
         handleSdInstallCommand(tokens[1], installOptions);
     } else if (cmd.equalsIgnoreCase("wifi") && tokens.size() >= 2) {
         handleWifiCommand(tokens);
+    } else if (cmd.equalsIgnoreCase("settings") && tokens.size() >= 2 && tokens[1].equalsIgnoreCase("get")) {
+        handleSettingsPrintCommand();
+    } else if (cmd.equalsIgnoreCase("settings")) {
+        launcherConsolePrintln("Usage: settings <get|set <json>>");
     } else if (cmd.equalsIgnoreCase("help")) {
         printHelp();
 #if defined(HAS_RESISTIVE_TOUCH)
@@ -1048,7 +1106,7 @@ void taskSerialConsole(void *parameter) {
                 break;
             }
             buffer += c;
-            if (buffer.length() > 512) buffer = ""; // guard against a runaway line
+            if (buffer.length() > 8192) buffer = "";
             vTaskDelay(pdMS_TO_TICKS(1));
         }
         vTaskDelay(pdMS_TO_TICKS(5));
