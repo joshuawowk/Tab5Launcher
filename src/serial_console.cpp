@@ -8,6 +8,7 @@
 #include "nvs_helpers.h"
 #include "partition_install_layout.h"
 #include "partition_table_model.h"
+#include "sd_functions.h"
 #include "settings.h"
 #include "utils.h"
 #include <Arduino.h>
@@ -888,6 +889,8 @@ static void printHelp() {
     launcherConsolePrintln("  partition edit <label> <offset> <size>");
     launcherConsolePrintln("  partition create <type> <subtype> <label> <size>");
     launcherConsolePrintln("  flash firmware <name> <size>");
+    launcherConsolePrintln("  sdput <sdpath> <size>");
+    launcherConsolePrintln("  sdinstall <sdpath> [--data=yes|no] [--restore=yes|no]");
     launcherConsolePrintln("  wifi auto");
     launcherConsolePrintln("  wifi scan");
     launcherConsolePrintln("  wifi connect <SSID> [PWD]");
@@ -904,6 +907,115 @@ static void printHelp() {
     launcherConsolePrintln("  sdio set <clk> <cmd> <d0> <d1> <d2> <d3> <rst>");
     launcherConsolePrintln("  sdio reset");
 #endif
+}
+
+// sdput <sdpath> <size>: reserve an SD file, reply "READY <size>", then the host
+// streams <size> raw bytes; each 2048-byte chunk is ACKed ("ACK done/total") so a
+// slow 115200 link never has more than one chunk in flight (same flow-control the
+// "flash firmware" streamer uses). Lets a host load firmware .bin files onto the SD
+// over USB serial without USB-MSC or Wi-Fi. Ends with "OK stored" or "ERR ...".
+static void handleSdPutCommand(const String &sdPath, uint32_t size) {
+    if (size == 0) {
+        launcherConsolePrintln("ERR invalid size");
+        return;
+    }
+    if (!setupSdCard()) {
+        launcherConsolePrintln("ERR SD card not available");
+        return;
+    }
+    String path = sdPath;
+    if (!path.startsWith("/")) path = "/" + path;
+    if (SDM.exists(path.c_str())) SDM.remove(path.c_str());
+    File out = SDM.open(path.c_str(), FILE_WRITE, true);
+    if (!out) {
+        launcherConsolePrintf("ERR cannot open %s\n", path.c_str());
+        return;
+    }
+
+    // Tell the host it's safe to start streaming the raw bytes now.
+    launcherConsolePrintf("READY %u\n", static_cast<unsigned>(size));
+
+    bool suspendedInput = xHandle != nullptr;
+    if (suspendedInput) vTaskSuspend(xHandle);
+
+    unsigned long previousTimeout = Serial.getTimeout();
+    Serial.setTimeout(5000);
+
+    constexpr size_t kChunkSize = 2048;
+    static uint8_t chunkBuffer[kChunkSize];
+    bool ok = true;
+    size_t written = 0;
+    String error;
+    while (ok && written < size) {
+        size_t toRead = std::min(kChunkSize, static_cast<size_t>(size) - written);
+        size_t got = Serial.readBytes(chunkBuffer, toRead);
+        if (got == 0) {
+            ok = false;
+            error = "Stream read timeout";
+            break;
+        }
+        if (out.write(chunkBuffer, got) != got) {
+            ok = false;
+            error = "SD write failed";
+            break;
+        }
+        written += got;
+        launcherConsolePrintf("ACK %u/%u\n", static_cast<unsigned>(written), static_cast<unsigned>(size));
+    }
+    out.flush();
+    out.close();
+
+    Serial.setTimeout(previousTimeout);
+    if (suspendedInput) vTaskResume(xHandle);
+
+    if (!ok) {
+        launcherConsolePrintf(
+            "ERR %s at %u/%u\n", error.c_str(), static_cast<unsigned>(written), static_cast<unsigned>(size)
+        );
+        return;
+    }
+    launcherConsolePrintln("");
+    launcherConsolePrintf("OK stored %s (%u bytes)\n", path.c_str(), static_cast<unsigned>(written));
+}
+
+// Parses a yes/no option value. Sets invalid on anything else so the caller can
+// reject the command rather than silently installing with the wrong semantics.
+static bool parseYesNo(const String &value, bool fallback, bool &invalid) {
+    if (value.equalsIgnoreCase("yes") || value.equalsIgnoreCase("y") || value == "1") return true;
+    if (value.equalsIgnoreCase("no") || value.equalsIgnoreCase("n") || value == "0") return false;
+    invalid = true;
+    return fallback;
+}
+
+// sdinstall <sdpath> [--data=yes|no] [--restore=yes|no]: install a firmware .bin
+// already on the SD through the same
+// path the SD file browser's "Install" action uses (updateFromSD) — it parses the
+// embedded partition table of a full-flash factory image, lays out app + data
+// partitions, flashes them and reboots into the app. Unlike "flash firmware" this
+// creates the app's SPIFFS/FAT/LittleFS data partitions. On success the device
+// reboots into the app (this command never returns); on failure it prints an error.
+//
+// updateFromSD() is driven non-interactively here. Both of its prompts call
+// loopOptions(), which spins until physical touch or keyboard input; since this
+// command runs on the serial console task -- the only task that drains Serial, and
+// the one that would service a "nav" command -- a prompt raised from here freezes
+// the console for good, emitting neither OK nor ERR. Defaults are copy-the-image's-
+// data and fresh-install; --data/--restore override per call.
+static void handleSdInstallCommand(const String &sdPath, const SdInstallOptions &installOptions) {
+    String path = sdPath;
+    if (!path.startsWith("/")) path = "/" + path;
+    if (!setupSdCard()) {
+        launcherConsolePrintln("ERR SD card not available");
+        return;
+    }
+    if (!SDM.exists(path.c_str())) {
+        launcherConsolePrintf("ERR not found: %s\n", path.c_str());
+        return;
+    }
+    launcherConsolePrintf("Installing %s from SD ...\n", path.c_str());
+    launcherConsoleFlush();
+    updateFromSD(path, installOptions); // reboots into the app on success; returns only on failure
+    launcherConsolePrintln("ERR install did not complete");
 }
 
 static void handleSerialCommand(const String &line) {
@@ -929,6 +1041,28 @@ static void handleSerialCommand(const String &line) {
         cmd.equalsIgnoreCase("flash") && tokens.size() >= 4 && tokens[1].equalsIgnoreCase("firmware")
     ) {
         handleFlashCommand(tokens[2], parseNumber(tokens[3]));
+    } else if (cmd.equalsIgnoreCase("sdput") && tokens.size() >= 3) {
+        handleSdPutCommand(tokens[1], parseNumber(tokens[2]));
+    } else if (cmd.equalsIgnoreCase("sdinstall") && tokens.size() >= 2) {
+        SdInstallOptions installOptions;
+        installOptions.interactive = false;
+        bool badFlag = false;
+        for (size_t i = 2; i < tokens.size(); ++i) {
+            const String &flag = tokens[i];
+            if (flag.startsWith("--data=")) {
+                installOptions.copyData = parseYesNo(flag.substring(7), installOptions.copyData, badFlag);
+            } else if (flag.startsWith("--restore=")) {
+                installOptions.restoreBackup =
+                    parseYesNo(flag.substring(10), installOptions.restoreBackup, badFlag);
+            } else {
+                badFlag = true;
+            }
+            if (badFlag) {
+                launcherConsolePrintf("ERR bad option: %s\n", flag.c_str());
+                return;
+            }
+        }
+        handleSdInstallCommand(tokens[1], installOptions);
     } else if (cmd.equalsIgnoreCase("wifi") && tokens.size() >= 2) {
         handleWifiCommand(tokens);
     } else if (cmd.equalsIgnoreCase("settings") && tokens.size() >= 2 && tokens[1].equalsIgnoreCase("get")) {

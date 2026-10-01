@@ -64,8 +64,16 @@ bool setupSdCard() {
     if (!SDM.begin(_cs, sdcardSPI))
 #else
     sdcardSPI.begin(_sck, _miso, _mosi, _cs); // start SPI communications
-    vTaskDelay(pdTICKS_TO_MS(10));
-    if (!SDM.begin(_cs, sdcardSPI))
+    // Some SPI SD cards (notably the M5Stack Tab5) intermittently miss the first
+    // init after a warm reset and report "Failed to mount SDCARD". Retry a few
+    // times with a short settle delay before giving up so a good card mounts
+    // reliably on boot.
+    bool _sdMountOk = false;
+    for (int _sdTry = 0; _sdTry < 6 && !_sdMountOk; ++_sdTry) {
+        vTaskDelay(pdMS_TO_TICKS(_sdTry == 0 ? 10 : 120));
+        _sdMountOk = SDM.begin(_cs, sdcardSPI);
+    }
+    if (!_sdMountOk)
 #endif
     {
         // sdcardSPI.end(); // Closes SPI connections and release pin header.
@@ -638,7 +646,7 @@ static uint32_t effectiveSdAppSize(File &file, uint32_t appOffset, uint32_t fall
 
 static bool installFromSdDynamic(
     File &file, const String &path, uint32_t appSize, uint32_t appOffset,
-    std::vector<LauncherInstallDataPartition> &dataPartitions
+    std::vector<LauncherInstallDataPartition> &dataPartitions, const SdInstallOptions &installOptions
 ) {
     String error;
     LauncherPartitionTable table;
@@ -674,7 +682,9 @@ static bool installFromSdDynamic(
             if (!bp.lastBackupPath.isEmpty() && SDM.exists(bp.lastBackupPath)) restorable.push_back(bp.label);
         }
         if (!restorable.empty()) {
-            if (autoBackup) {
+            if (!installOptions.interactive) {
+                shouldRestore = installOptions.restoreBackup;
+            } else if (autoBackup) {
                 int choice = -1;
                 std::vector<Option> opts = {
                     {"Restore Data",  [&]() { choice = 0; }},
@@ -797,7 +807,7 @@ DONE:
 ** Function name: updateFromSD
 ** Description:   this function analyse the .bin and calls installFromSdDynamic
 ***************************************************************************************/
-void updateFromSD(const String &path) {
+void updateFromSD(const String &path, const SdInstallOptions &installOptions) {
     uint8_t partitionEntry[LAUNCHER_PARTITION_ENTRY_SIZE];
     uint32_t app_size = 0;
     uint32_t app_offset = 0;
@@ -811,7 +821,7 @@ void updateFromSD(const String &path) {
 
     if (partitionEntry[0] != 0xAA || partitionEntry[1] != 0x50 || partitionEntry[2] != 0x01) {
         app_size = effectiveSdAppSize(file, 0, file.size());
-        if (!installFromSdDynamic(file, path, app_size, 0, dataPartitions)) { goto Exit; }
+        if (!installFromSdDynamic(file, path, app_size, 0, dataPartitions, installOptions)) { goto Exit; }
         file.close();
         tft->fillScreen(BGCOLOR);
 
@@ -924,7 +934,9 @@ void updateFromSD(const String &path) {
                 }
             );
             if (spiffsIt != dataPartitions.end()) {
-                if (!askSpiffs) {
+                if (!installOptions.interactive) {
+                    if (!installOptions.copyData) spiffsIt->copySize = 0;
+                } else if (!askSpiffs) {
                     spiffsIt->copySize = 0;
                 } else if (spiffsIt->copySize > 0) {
                     bool copySpiffs = true;
@@ -947,7 +959,9 @@ void updateFromSD(const String &path) {
         log_i("Appsize: %d", app_size);
         log_i("Data partitions: %d", dataPartitions.size());
 
-        if (!installFromSdDynamic(file, path, app_size, app_offset, dataPartitions)) { goto Exit; }
+        if (!installFromSdDynamic(file, path, app_size, app_offset, dataPartitions, installOptions)) {
+            goto Exit;
+        }
         displayMsg("Complete");
 
         return (void)releaseHeapObjectsAndReboot();

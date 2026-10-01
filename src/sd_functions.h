@@ -31,7 +31,22 @@ bool sortList(const Option &a, const Option &b);
 
 String loopSD(bool filePicker = false);
 
-void updateFromSD(const String &path);
+// Controls the two interactive prompts inside updateFromSD(). The on-device UI
+// leaves this defaulted, so its behaviour is unchanged. A headless caller (the
+// serial console) must set interactive=false: loopOptions() only unblocks on
+// physical touch/keyboard, and the serial console task is the sole reader of
+// Serial, so a prompt raised from there deadlocks the console with no output.
+//
+// Note the flags cannot express the headless case on their own -- askSpiffs=false
+// means "do not copy data" and autoBackup=false means "always restore" -- which is
+// why copyData/restoreBackup are carried separately.
+struct SdInstallOptions {
+    bool interactive = true;    // may call loopOptions()
+    bool copyData = true;       // non-interactive: copy the image's data partition
+    bool restoreBackup = false; // non-interactive: fresh install, ignore old backup
+};
+
+void updateFromSD(const String &path, const SdInstallOptions &installOptions = SdInstallOptions());
 
 bool performDATAUpdate(Stream &updateSource, size_t updateSize, const char *label);
 
